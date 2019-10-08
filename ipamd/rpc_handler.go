@@ -22,6 +22,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/health"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/reflection"
 
@@ -38,11 +39,6 @@ const (
 // server controls RPC service responses.
 type server struct {
 	ipamContext *IPAMContext
-}
-
-// Check is for health checking.
-func (s *server) Check(ctx context.Context, req *healthpb.HealthCheckRequest) (*healthpb.HealthCheckResponse, error) {
-	return &healthpb.HealthCheckResponse{Status: healthpb.HealthCheckResponse_SERVING}, nil
 }
 
 // AddNetwork processes CNI add network request and return an IP address for container
@@ -101,7 +97,14 @@ func (s *server) DelNetwork(ctx context.Context, in *pb.DelNetworkRequest) (*pb.
 	}
 	log.Infof("Send DelNetworkReply: IPv4Addr %s, DeviceNumber: %d, err: %v", ip, deviceNumber, err)
 
-	return &pb.DelNetworkReply{Success: err == nil, IPv4Addr: ip, DeviceNumber: int32(deviceNumber)}, nil
+	// Plugins should generally complete a DEL action without error even if some resources are missing. For example,
+	// an IPAM plugin should generally release an IP allocation and return success even if the container network
+	// namespace no longer exists, unless that network namespace is critical for IPAM management
+	success := true
+	if err != nil && err != datastore.ErrUnknownPod {
+		success = false
+	}
+	return &pb.DelNetworkReply{Success: success, IPv4Addr: ip, DeviceNumber: int32(deviceNumber)}, nil
 }
 
 // RunRPCHandler handles request from gRPC
@@ -115,7 +118,10 @@ func (c *IPAMContext) RunRPCHandler() error {
 	}
 	s := grpc.NewServer()
 	pb.RegisterCNIBackendServer(s, &server{ipamContext: c})
-	healthpb.RegisterHealthServer(s, &server{})
+	hs := health.NewServer()
+	// TODO: Implement watch once the status is check is handled correctly.
+	hs.SetServingStatus("grpc.health.v1.aws-node", healthpb.HealthCheckResponse_SERVING)
+	healthpb.RegisterHealthServer(s, hs)
 	// Register reflection service on gRPC server.
 	reflection.Register(s)
 	if err := s.Serve(lis); err != nil {
