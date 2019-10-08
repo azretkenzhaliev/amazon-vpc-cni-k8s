@@ -74,6 +74,7 @@ func _main() int {
 	// CNI introspection endpoints
 	go ipamContext.ServeIntrospection()
 
+	/*
 	// Copy the CNI plugin and config. This will mark the node as Ready.
 	log.Info("Copying /app/aws-cni to /host/opt/cni/bin/aws-cni")
 	err = copyFileContents("/app/aws-cni", "/host/opt/cni/bin/aws-cni")
@@ -88,6 +89,7 @@ func _main() int {
 		log.Errorf("Failed to copy 10-aws.conflist: %v", err)
 		return 1
 	}
+	*/
 
 	// Start the RPC listener
 	err = ipamContext.RunRPCHandler()
