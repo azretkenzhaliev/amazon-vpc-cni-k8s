@@ -16,6 +16,7 @@ package awsutils
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"os"
 	"strconv"
 	"strings"
@@ -28,10 +29,12 @@ import (
 
 	"github.com/aws/amazon-vpc-cni-k8s/pkg/ec2metadata"
 	"github.com/aws/amazon-vpc-cni-k8s/pkg/ec2wrapper"
+	"github.com/aws/amazon-vpc-cni-k8s/pkg/utils/retry"
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/ec2"
+	"k8s.io/apimachinery/pkg/util/wait"
 )
 
 const (
@@ -49,19 +52,22 @@ const (
 	metadataInterface    = "/interface-id/"
 	metadataSubnetCIDR   = "/subnet-ipv4-cidr-block"
 	metadataIPv4s        = "/local-ipv4s"
-	maxENIDeleteRetries  = 20
+	maxENIDeleteRetries  = 12
+	maxENIBackoffDelay   = time.Minute
 	eniDescriptionPrefix = "aws-K8S-"
 	metadataOwnerID      = "/owner-id"
+
 	// AllocENI need to choose a first free device number between 0 and maxENI
 	maxENIs           = 128
 	clusterNameEnvVar = "CLUSTER_NAME"
 	eniNodeTagKey     = "node.k8s.amazonaws.com/instance_id"
 	eniClusterTagKey  = "cluster.k8s.amazonaws.com/name"
 
-	retryDeleteENIInternal = 5 * time.Second
-
 	// UnknownInstanceType indicates that the instance type is not yet supported
 	UnknownInstanceType = "vpc ip resource(eni ip limit): unknown instance type"
+
+	// Stagger cleanup start time to avoid calling EC2 too much. Time in seconds.
+	eniCleanupStartupDelayMax = 300
 )
 
 // ErrENINotFound is an error when ENI is not found.
@@ -223,6 +229,10 @@ func New() (*EC2InstanceMetadataCache, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// Clean up leaked ENIs in the background
+	go wait.Forever(cache.cleanUpLeakedENIs, time.Hour)
+
 	return cache, nil
 }
 
@@ -550,15 +560,16 @@ func (cache *EC2InstanceMetadataCache) AllocENI(useCustomCfg bool, sg []*string,
 		return "", errors.Wrap(err, "AllocENI: failed to create ENI")
 	}
 
-	cache.tagENI(eniID)
-
 	attachmentID, err := cache.attachENI(eniID)
 	if err != nil {
-		_ = cache.deleteENI(eniID, retryDeleteENIInternal)
+		_ = cache.deleteENI(eniID, maxENIBackoffDelay)
 		return "", errors.Wrap(err, "AllocENI: error attaching ENI")
 	}
 
-	// also change the ENI's attribute so that the ENI will be deleted when the instance is deleted.
+	// Once the ENI is attached, tag it.
+	cache.tagENI(eniID)
+
+	// Also change the ENI's attribute so that the ENI will be deleted when the instance is deleted.
 	attributeInput := &ec2.ModifyNetworkInterfaceAttributeInput{
 		Attachment: &ec2.NetworkInterfaceAttachmentChanges{
 			AttachmentId:        aws.String(attachmentID),
@@ -674,15 +685,17 @@ func (cache *EC2InstanceMetadataCache) tagENI(eniID string) {
 		Tags: tags,
 	}
 
-	start := time.Now()
-	_, err := cache.ec2SVC.CreateTags(input)
-	awsAPILatency.WithLabelValues("CreateTags", fmt.Sprint(err != nil)).Observe(msSince(start))
-	if err != nil {
-		awsAPIErrInc("CreateTags", err)
-		log.Warnf("Failed to tag the newly created ENI %s: %v", eniID, err)
-	} else {
+	_ = retry.RetryNWithBackoff(retry.NewSimpleBackoff(time.Second, time.Minute, 0.3, 2), 5, func() error {
+		start := time.Now()
+		_, err := cache.ec2SVC.CreateTags(input)
+		awsAPILatency.WithLabelValues("CreateTags", fmt.Sprint(err != nil)).Observe(msSince(start))
+		if err != nil {
+			awsAPIErrInc("CreateTags", err)
+			return log.Warnf("Failed to tag the newly created ENI %s: %v", eniID, err)
+		}
 		log.Debugf("Successfully tagged ENI: %s", eniID)
-	}
+		return nil
+	})
 }
 
 //containsAttachmentLimitExceededError returns whether exceeds instance's ENI limit
@@ -713,14 +726,13 @@ func awsUtilsErrInc(fn string, err error) {
 
 // FreeENI detaches and deletes the ENI interface
 func (cache *EC2InstanceMetadataCache) FreeENI(eniName string) error {
-	return cache.freeENI(eniName, retryDeleteENIInternal)
+	return cache.freeENI(eniName, maxENIBackoffDelay)
 }
 
-func (cache *EC2InstanceMetadataCache) freeENI(eniName string, retryDeleteENISleepDuration time.Duration) error {
+func (cache *EC2InstanceMetadataCache) freeENI(eniName string, maxBackoffDelay time.Duration) error {
 	log.Infof("Trying to free ENI: %s", eniName)
 
 	// Find out attachment
-	// TODO: use metadata
 	_, attachID, err := cache.DescribeENI(eniName)
 	if err != nil {
 		if err == ErrENINotFound {
@@ -739,31 +751,27 @@ func (cache *EC2InstanceMetadataCache) freeENI(eniName string, retryDeleteENISle
 	}
 
 	// Retry detaching the ENI from the instance
-	var retry int
-	for retry = 0; retry <= maxENIDeleteRetries; retry++ {
+	err = retry.RetryNWithBackoff(retry.NewSimpleBackoff(time.Millisecond*200, maxBackoffDelay, 0.15, 2.0), maxENIDeleteRetries, func() error {
 		start := time.Now()
-		_, err = cache.ec2SVC.DetachNetworkInterface(detachInput)
-		awsAPILatency.WithLabelValues("DetachNetworkInterface", fmt.Sprint(err != nil)).Observe(msSince(start))
-		if err != nil {
-			awsAPIErrInc("DetachNetworkInterface", err)
-			log.Errorf("Failed to detach ENI %s %v", eniName, err)
-			if retry == maxENIDeleteRetries {
-				return errors.New("unable to detach ENI from EC2 instance, giving up")
-			}
-		} else {
-			log.Infof("Successfully detached ENI: %s", eniName)
-			break
+		_, ec2Err := cache.ec2SVC.DetachNetworkInterface(detachInput)
+		awsAPILatency.WithLabelValues("DetachNetworkInterface", fmt.Sprint(ec2Err != nil)).Observe(msSince(start))
+		if ec2Err != nil {
+			awsAPIErrInc("DetachNetworkInterface", ec2Err)
+			log.Errorf("Failed to detach ENI %s %v", eniName, ec2Err)
+			return errors.New("unable to detach ENI from EC2 instance, giving up")
 		}
+		log.Infof("Successfully detached ENI: %s", eniName)
+		return nil
+	})
 
-		log.Debugf("Not able to detach ENI yet (attempt %d/%d): %v ", retry, maxENIDeleteRetries, err)
-		time.Sleep(retryDeleteENISleepDuration)
+	if err != nil {
+		log.Errorf("Failed to detach ENI %s %v", eniName, err)
+		return err
 	}
 
-	// It may take awhile for EC2-VPC to detach ENI from instance
-	// retry maxENIDeleteRetries times with sleep 5 sec between to delete the interface
-	// TODO check if can use built-in waiter in the aws-sdk-go,
-	// Example: https://github.com/aws/aws-sdk-go/blob/master/service/ec2/waiters.go#L874
-	err = cache.deleteENI(eniName, retryDeleteENISleepDuration)
+	// It does take awhile for EC2 to detach ENI from instance, so we wait 2s before trying the delete.
+	time.Sleep(2 * time.Second)
+	err = cache.deleteENI(eniName, maxBackoffDelay)
 	if err != nil {
 		awsUtilsErrInc("FreeENIDeleteErr", err)
 		return errors.Wrapf(err, "FreeENI: failed to free ENI: %s", eniName)
@@ -773,32 +781,31 @@ func (cache *EC2InstanceMetadataCache) freeENI(eniName string, retryDeleteENISle
 	return nil
 }
 
-func (cache *EC2InstanceMetadataCache) deleteENI(eniName string, retryDeleteENIInternal time.Duration) error {
+func (cache *EC2InstanceMetadataCache) deleteENI(eniName string, maxBackoffDelay time.Duration) error {
 	log.Debugf("Trying to delete ENI: %s", eniName)
-
-	retry := 0
-	var err error
-	for {
-		retry++
-		if retry > maxENIDeleteRetries {
-			return errors.New("unable to delete ENI, giving up")
-		}
-
-		deleteInput := &ec2.DeleteNetworkInterfaceInput{
-			NetworkInterfaceId: aws.String(eniName),
-		}
-		start := time.Now()
-		_, err = cache.ec2SVC.DeleteNetworkInterface(deleteInput)
-		awsAPILatency.WithLabelValues("DeleteNetworkInterface", fmt.Sprint(err != nil)).Observe(msSince(start))
-		if err == nil {
-			log.Infof("Successfully deleted ENI: %s", eniName)
-			return nil
-		}
-		awsAPIErrInc("DeleteNetworkInterface", err)
-
-		log.Debugf("Not able to delete ENI yet (attempt %d/%d): %v ", retry, maxENIDeleteRetries, err)
-		time.Sleep(retryDeleteENIInternal)
+	deleteInput := &ec2.DeleteNetworkInterfaceInput{
+		NetworkInterfaceId: aws.String(eniName),
 	}
+	err := retry.RetryNWithBackoff(retry.NewSimpleBackoff(time.Millisecond*500, maxBackoffDelay, 0.15, 2.0), maxENIDeleteRetries, func() error {
+		start := time.Now()
+		_, ec2Err := cache.ec2SVC.DeleteNetworkInterface(deleteInput)
+		awsAPILatency.WithLabelValues("DeleteNetworkInterface", fmt.Sprint(ec2Err != nil)).Observe(msSince(start))
+		if ec2Err != nil {
+			if aerr, ok := ec2Err.(awserr.Error); ok {
+				// If already deleted, we are good
+				if aerr.Code() == "InvalidNetworkInterfaceID.NotFound" {
+					log.Infof("ENI %s has already been deleted", eniName)
+					return nil
+				}
+			}
+			awsAPIErrInc("DeleteNetworkInterface", ec2Err)
+			log.Debugf("Not able to delete ENI: %v ", ec2Err)
+			return errors.Wrapf(ec2Err, "unable to delete ENI")
+		}
+		log.Infof("Successfully deleted ENI: %s", eniName)
+		return nil
+	})
+	return err
 }
 
 // DescribeENI returns the IPv4 addresses of interface and the attachment id
@@ -886,7 +893,6 @@ func (cache *EC2InstanceMetadataCache) AllocIPAddresses(eniID string, numIPs int
 	}
 
 	log.Infof("Trying to allocate %d IP addresses on ENI %s", needIPs, eniID)
-
 	input := &ec2.AssignPrivateIpAddressesInput{
 		NetworkInterfaceId:             aws.String(eniID),
 		SecondaryPrivateIpAddressCount: aws.Int64(int64(needIPs)),
@@ -909,10 +915,8 @@ func (cache *EC2InstanceMetadataCache) AllocIPAddresses(eniID string, numIPs int
 // DeallocIPAddresses allocates numIPs of IP address on an ENI
 func (cache *EC2InstanceMetadataCache) DeallocIPAddresses(eniID string, ips []string) error {
 	ctx := context.Background()
-
 	log.Infof("Trying to unassign the following IPs %s from ENI %s", ips, eniID)
-
-	ipsInput := []*string{}
+	var ipsInput []*string
 	for _, ip := range ips {
 		ipsInput = append(ipsInput, aws.String(ip))
 	}
@@ -931,6 +935,71 @@ func (cache *EC2InstanceMetadataCache) DeallocIPAddresses(eniID string, ips []st
 		return errors.Wrap(err, fmt.Sprintf("deallocate IP addresses: failed to deallocate private IP addresses: %s", ips))
 	}
 	return nil
+}
+
+func (cache *EC2InstanceMetadataCache) cleanUpLeakedENIs() {
+	rand.Seed(time.Now().UnixNano())
+	startupDelay := time.Duration(rand.Intn(eniCleanupStartupDelayMax)) * time.Second
+	log.Infof("Will attempt to clean up AWS CNI leaked ENIs after waiting %s.", startupDelay)
+	time.Sleep(startupDelay)
+
+	log.Debug("Checking for leaked AWS CNI ENIs.")
+	networkInterfaces, err := cache.getFilteredListOfNetworkInterfaces()
+	if err != nil {
+		log.Warnf("Unable to get leaked ENIs: %v", err)
+	} else {
+		// Clean up all the leaked ones we found
+		for _, networkInterface := range networkInterfaces {
+			eniID := aws.StringValue(networkInterface.NetworkInterfaceId)
+			err = cache.deleteENI(eniID, maxENIBackoffDelay)
+			if err != nil {
+				log.Warnf("Failed to clean up leaked ENI %s: %v", eniID, err)
+			}
+		}
+	}
+}
+
+// getFilteredListOfNetworkInterfaces calls DescribeNetworkInterfaces to get all available ENIs that were allocated by
+// the AWS CNI plugin, but were not deleted.
+func (cache *EC2InstanceMetadataCache) getFilteredListOfNetworkInterfaces() ([]*ec2.NetworkInterface, error) {
+	// The tag key has to be "node.k8s.amazonaws.com/instance_id"
+	tagFilter := &ec2.Filter{
+		Name: aws.String("tag-key"),
+		Values: []*string{
+			aws.String(eniNodeTagKey),
+		},
+	}
+	// Only fetch "available" ENIs.
+	statusFilter := &ec2.Filter{
+		Name: aws.String("status"),
+		Values: []*string{
+			aws.String("available"),
+		},
+	}
+
+	input := &ec2.DescribeNetworkInterfacesInput{
+		Filters: []*ec2.Filter{tagFilter, statusFilter},
+	}
+	result, err := cache.ec2SVC.DescribeNetworkInterfaces(input)
+	if err != nil {
+		return nil, errors.Wrap(err, "awsutils: unable to obtain filtered list of network interfaces")
+	}
+
+	networkInterfaces := make([]*ec2.NetworkInterface, 0)
+	for _, networkInterface := range result.NetworkInterfaces {
+		// Verify the description starts with "aws-K8S-"
+		if strings.HasPrefix(aws.StringValue(networkInterface.Description), eniDescriptionPrefix) {
+			networkInterfaces = append(networkInterfaces, networkInterface)
+		}
+	}
+
+	if len(networkInterfaces) < 1 {
+		log.Debug("No AWS CNI leaked ENIs found.")
+		return nil, nil
+	}
+
+	log.Debugf("Found %d available instances with the AWS CNI tag.", len(networkInterfaces))
+	return networkInterfaces, nil
 }
 
 // GetVPCIPv4CIDR returns VPC CIDR
