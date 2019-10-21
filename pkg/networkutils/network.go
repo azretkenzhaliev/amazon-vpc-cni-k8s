@@ -941,7 +941,11 @@ func GetEthernetMTU() int {
 	if envMTUValue := os.Getenv(envMTU); envMTUValue != "" {
 		mtu, err := strconv.Atoi(envMTUValue)
 		if err != nil {
+<<<<<<< HEAD
 			log.Errorf("Failed to parse %s will use %d: %v", envMTU, maximumMTU, err.Error())
+=======
+			log.Errorf("Failed to parse %s will use %d: %v", envMTU,  maximumMTU, err.Error())
+>>>>>>> eb28c0accd0bd357699c8822253416f3940a8b1a
 			return maximumMTU
 		}
 		// Restrict range between jumbo frame and the maximum required size to assemble.
@@ -951,7 +955,11 @@ func GetEthernetMTU() int {
 			log.Errorf("%s is too low: %d. Will use %d", envMTU, mtu, minimumMTU)
 			return minimumMTU
 		}
+<<<<<<< HEAD
 		if mtu > maximumMTU {
+=======
+		if mtu > maximumMTU  {
+>>>>>>> eb28c0accd0bd357699c8822253416f3940a8b1a
 			log.Errorf("%s is too high: %d. Will use %d", envMTU, mtu, maximumMTU)
 			return maximumMTU
 		}
