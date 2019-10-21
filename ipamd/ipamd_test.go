@@ -78,6 +78,8 @@ func TestNodeInit(t *testing.T) {
 		maxENI:        4,
 		warmENITarget: 1,
 		warmIPTarget:  3,
+		primaryIP:     make(map[string]string),
+		terminating:   int32(0),
 		networkClient: mockNetwork}
 
 	eni1 := awsutils.ENIMetadata{
@@ -146,6 +148,9 @@ func TestNodeInit(t *testing.T) {
 	mockAWS.EXPECT().GetVPCIPv4CIDRs().Return(cidrs)
 	mockNetwork.EXPECT().UseExternalSNAT().Return(false)
 	mockNetwork.EXPECT().UpdateRuleListBySrc(gomock.Any(), gomock.Any(), gomock.Any(), true)
+	// Add IPs
+	mockAWS.EXPECT().AllocIPAddresses(gomock.Any(), gomock.Any())
+	mockAWS.EXPECT().DescribeENI(gomock.Any()).Return(eniResp, &attachmentID, nil)
 
 	err := mockContext.nodeInit()
 	assert.NoError(t, err)
@@ -175,6 +180,7 @@ func testIncreaseIPPool(t *testing.T, useENIConfig bool) {
 		useCustomNetworking: UseCustomNetworkCfg(),
 		eniConfig:           mockENIConfig,
 		primaryIP:           make(map[string]string),
+		terminating:         int32(0),
 	}
 
 	mockContext.dataStore = datastore.NewDataStore()
@@ -252,6 +258,7 @@ func TestTryAddIPToENI(t *testing.T) {
 		networkClient: mockNetwork,
 		eniConfig:     mockENIConfig,
 		primaryIP:     make(map[string]string),
+		terminating:   int32(0),
 	}
 
 	mockContext.dataStore = datastore.NewDataStore()
@@ -310,6 +317,7 @@ func TestNodeIPPoolReconcile(t *testing.T) {
 		k8sClient:     mockK8S,
 		networkClient: mockNetwork,
 		primaryIP:     make(map[string]string),
+		terminating:   int32(0),
 	}
 
 	mockContext.dataStore = datastore.NewDataStore()
@@ -397,6 +405,7 @@ func TestGetWarmIPTargetState(t *testing.T) {
 		k8sClient:     mockK8S,
 		networkClient: mockNetwork,
 		primaryIP:     make(map[string]string),
+		terminating:   int32(0),
 	}
 
 	mockContext.dataStore = datastore.NewDataStore()
